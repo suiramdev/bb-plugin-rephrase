@@ -56,7 +56,13 @@ function rpcHandlers(
 ): PluginRpcTestHandlers<typeof rpcContract> {
   return {
     rephrase: () => ({ ok: true, text: "Rewritten." }),
-    catalog: () => ({ selection: null, choices: CHOICES, unavailable: [] }),
+    catalog: () => ({
+      selection: null,
+      choices: CHOICES,
+      unavailable: [],
+      pending: [],
+      discovering: false,
+    }),
     selectAgent: ({ selection }) => ({ selection }),
     ...overrides,
   };
@@ -219,6 +225,8 @@ describe("agent picker", () => {
         selection: { providerId: "codex", model: "gpt-legacy" },
         choices: CHOICES,
         unavailable: ["Gemini"],
+        pending: [],
+        discovering: false,
       }),
     });
 
@@ -226,6 +234,24 @@ describe("agent picker", () => {
       slot.getByRole("button", { name: /gpt-legacy/ }).getAttribute("aria-pressed"),
     ).toBe("true");
     expect(slot.getByText(/No models from Gemini/)).toBeDefined();
+  });
+
+  it("lists what has arrived while the slower agents are still answering", async () => {
+    const slot = await renderPicker({
+      catalog: () => ({
+        selection: null,
+        choices: CHOICES.filter((choice) => choice.providerId === "codex"),
+        unavailable: [],
+        pending: ["Claude Code"],
+        discovering: true,
+      }),
+    });
+
+    expect(slot.getByText("5.5")).toBeDefined();
+    expect(slot.getByText(/Loading models from Claude Code/)).toBeDefined();
+    expect(
+      slot.getByRole("button", { name: "Reload models" }).hasAttribute("disabled"),
+    ).toBe(true);
   });
 
   it("reports a catalogue that could not be read", async () => {

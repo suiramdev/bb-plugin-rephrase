@@ -1,7 +1,7 @@
 // The plugin's own model picker: a search box over the model catalogue that
 // filters the way the prompt input's picker does.
 import { useCallback, useEffect, useState } from "react";
-import { useRpc } from "@get-bb/plugin-sdk/app";
+import { useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "../server";
 import {
@@ -20,6 +20,8 @@ interface Catalog {
   selection: AgentSelection | null;
   choices: ModelChoice[];
   unavailable: string[];
+  pending: string[];
+  discovering: boolean;
 }
 
 type LoadState =
@@ -35,7 +37,11 @@ export function AgentPicker() {
 
   const load = useCallback(
     async (refresh: boolean) => {
-      setState({ status: "loading" });
+      // Keep whatever is already listed: a refresh, or a partial catalogue
+      // arriving over realtime, must not blank the list.
+      setState((current) =>
+        current.status === "ready" ? current : { status: "loading" },
+      );
       try {
         setState({
           status: "ready",
@@ -54,6 +60,9 @@ export function AgentPicker() {
   useEffect(() => {
     void load(false);
   }, [load]);
+
+  // Discovery publishes each agent's models as they land.
+  useRealtime("catalog", () => void load(false));
 
   if (state.status === "loading") {
     return (
@@ -76,7 +85,7 @@ export function AgentPicker() {
   }
 
   const catalog = state.catalog;
-  const { selection, choices, unavailable } = catalog;
+  const { selection, choices, unavailable, pending, discovering } = catalog;
   const listed = filterModelChoices(
     withSelectionChoice(choices, selection),
     query,
@@ -132,11 +141,16 @@ export function AgentPicker() {
         </div>
         <Button
           aria-label="Reload models"
+          disabled={discovering}
           onClick={() => void load(true)}
           size="icon"
           variant="ghost"
         >
-          <Icon aria-hidden className="size-4" name="RotateCcw" />
+          <Icon
+            aria-hidden
+            className={cn("size-4", discovering && "animate-spin")}
+            name="RotateCcw"
+          />
         </Button>
       </div>
 
@@ -169,10 +183,19 @@ export function AgentPicker() {
         ))}
         {groups.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
-            No models match your search.
+            {query.trim() === ""
+              ? "No agent reported any models."
+              : "No models match your search."}
           </p>
         ) : null}
       </div>
+
+      {pending.length > 0 ? (
+        <p className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Icon aria-hidden className="size-3.5 animate-spin" name="Spinner" />
+          Loading models from {pending.join(", ")}…
+        </p>
+      ) : null}
 
       {unavailable.length > 0 ? (
         <p className="text-xs text-muted-foreground">

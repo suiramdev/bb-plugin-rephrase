@@ -29,8 +29,14 @@ export const DEFAULT_INSTRUCTION = [
 /** kv key holding the chosen agent; absent means the composer's own agent. */
 const SELECTION_KEY = "agent-selection";
 
-/** How long a discovered model catalogue is reused. */
-const CATALOG_TTL_MS = 60_000;
+/** kv key holding the last discovered model catalogue. */
+const CATALOG_KEY = "model-catalog";
+
+/** Realtime channel telling open pickers that the catalogue moved. */
+const CATALOG_CHANNEL = "catalog";
+
+/** How long a stored catalogue is served before it is refreshed. */
+const CATALOG_TTL_MS = 10 * 60_000;
 
 const TIMEOUT_OPTIONS: Record<string, number> = {
   "30 seconds": 30_000,
@@ -100,7 +106,11 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       selection: agentSelectionSchema.nullable(),
       choices: z.array(modelChoiceSchema),
+      /** Agents that reported no catalogue, by display name. */
       unavailable: z.array(z.string()),
+      /** Agents still being asked, by display name. */
+      pending: z.array(z.string()),
+      discovering: z.boolean(),
     }),
   },
   selectAgent: {
@@ -178,11 +188,10 @@ export default function plugin(bb: BbPluginApi) {
     },
 
     async catalog({ refresh }) {
-      const { choices, unavailable } = await catalog.read(refresh);
+      const snapshot = await catalog.read(refresh);
       return {
         selection: (await bb.storage.kv.get<AgentSelection>(SELECTION_KEY)) ?? null,
-        choices,
-        unavailable,
+        ...snapshot,
       };
     },
 
@@ -197,81 +206,167 @@ export default function plugin(bb: BbPluginApi) {
   });
 }
 
-/** Every model of every available provider, plus the providers that failed. */
-interface ModelCatalog {
+/** What the picker knows right now; also what is cached between reloads. */
+interface CatalogSnapshot {
   choices: ModelChoice[];
   unavailable: string[];
+  pending: string[];
+  at: number;
 }
 
 /**
- * Discovery asks each provider for its models, which can mean launching that
- * provider's CLI, so a catalogue is reused for a minute and concurrent readers
- * share one in-flight discovery.
+ * The model catalogue, cached and filled in as it arrives.
+ *
+ * Asking an agent for its models can mean launching its CLI, and one slow
+ * agent held the whole list up for half a minute, so: the last catalogue is
+ * kept in kv and served immediately, a stale one is refreshed in the
+ * background, and every partial result is published so the picker fills in
+ * while discovery is still running.
  */
 function createCatalogCache(bb: BbPluginApi) {
-  let cached: { at: number; catalog: Promise<ModelCatalog> } | null = null;
+  let snapshot: CatalogSnapshot | null = null;
+  let discovery: Promise<void> | null = null;
+  /** Readers waiting for the next snapshot, so a cold read can answer early. */
+  let waiting: (() => void)[] = [];
+
+  function wake() {
+    const woken = waiting;
+    waiting = [];
+    for (const resolve of woken) resolve();
+  }
+
+  async function publish(next: CatalogSnapshot) {
+    snapshot = next;
+    wake();
+    try {
+      await bb.storage.kv.set(CATALOG_KEY, next);
+      bb.realtime.publish(CATALOG_CHANNEL, { pending: next.pending.length });
+    } catch (error) {
+      // A reload can invalidate the api handle mid-discovery, and the kv row
+      // is only a cache: keep the in-memory snapshot and move on.
+      bb.log.debug(`could not store the catalogue: ${describeError(error)}`);
+    }
+  }
+
+  function discover(): Promise<void> {
+    discovery ??= runDiscovery(bb, () => snapshot, publish).finally(() => {
+      discovery = null;
+      wake();
+    });
+    return discovery;
+  }
+
   return {
-    read(refresh: boolean): Promise<ModelCatalog> {
-      const fresh =
-        cached !== null && Date.now() - cached.at < CATALOG_TTL_MS && !refresh;
-      if (!fresh) {
-        const pending = discoverModels(bb);
-        cached = { at: Date.now(), catalog: pending };
-        // A failed discovery must not be cached as the answer for a minute.
-        pending.catch(() => {
-          if (cached?.catalog === pending) cached = null;
-        });
+    async read(
+      refresh: boolean,
+    ): Promise<Omit<CatalogSnapshot, "at"> & { discovering: boolean }> {
+      snapshot ??= (await bb.storage.kv.get<CatalogSnapshot>(CATALOG_KEY)) ?? null;
+      const stale =
+        snapshot === null || Date.now() - snapshot.at > CATALOG_TTL_MS;
+      if (refresh || stale) {
+        const round = discover();
+        round.catch((error: unknown) =>
+          bb.log.warn(`model discovery failed: ${describeError(error)}`),
+        );
+        // With nothing cached, answer as soon as discovery knows which agents
+        // it is asking; their models then arrive over the realtime channel.
+        if (snapshot === null) {
+          await Promise.race([
+            new Promise<void>((resolve) => waiting.push(resolve)),
+            round,
+          ]);
+        }
       }
-      return cached!.catalog;
+      if (snapshot === null) {
+        throw new Error("No agent reported any models.");
+      }
+      return {
+        choices: snapshot.choices,
+        unavailable: snapshot.unavailable,
+        pending: snapshot.pending,
+        discovering: discovery !== null,
+      };
     },
   };
 }
 
-async function discoverModels(bb: BbPluginApi): Promise<ModelCatalog> {
+/**
+ * Ask every signed-in agent for its models in parallel, publishing after each
+ * answer. A catalogue that is already on screen is kept until the round
+ * finishes, so a background refresh never blanks the list.
+ */
+async function runDiscovery(
+  bb: BbPluginApi,
+  current: () => CatalogSnapshot | null,
+  publish: (next: CatalogSnapshot) => Promise<void>,
+): Promise<void> {
   const providers = (await bb.sdk.providers.list()).filter(
     (provider) => provider.available,
   );
-  const results = await Promise.all(
+  const previous = current()?.choices ?? [];
+  const answered = new Map<string, ModelChoice[]>();
+  const unavailable: string[] = [];
+  let pending = providers.map((provider) => provider.displayName);
+
+  const publishRound = () => {
+    const collected = providers.flatMap(
+      (provider) => answered.get(provider.id) ?? [],
+    );
+    return publish({
+      choices: previous.length > 0 && pending.length > 0 ? previous : collected,
+      unavailable: [...unavailable],
+      pending: [...pending],
+      at: Date.now(),
+    });
+  };
+
+  await publishRound();
+  await Promise.all(
     providers.map(async (provider) => {
-      try {
-        return {
-          provider,
-          options: await bb.sdk.providers.models({ providerId: provider.id }),
-        };
-      } catch (error) {
-        bb.log.debug(`no models for ${provider.id}: ${describeError(error)}`);
-        return { provider, options: null };
-      }
+      const choices = await providerChoices(bb, provider);
+      if (choices === null) unavailable.push(provider.displayName);
+      else answered.set(provider.id, choices);
+      pending = pending.filter((name) => name !== provider.displayName);
+      await publishRound();
     }),
   );
+}
 
-  const choices: ModelChoice[] = [];
-  const unavailable: string[] = [];
-  for (const { provider, options } of results) {
-    // A provider whose CLI is missing or unauthenticated reports its failure
-    // instead of a catalogue; name it rather than dropping it silently.
-    if (options === null || options.modelLoadError !== null) {
-      unavailable.push(provider.displayName);
-      continue;
-    }
-    const toChoice = (
-      entry: { model: string; displayName: string; description: string },
-      extra: boolean,
-    ): ModelChoice => ({
-      providerId: provider.id,
-      providerName: provider.displayName,
-      model: entry.model,
-      label: stripModelBrandPrefix(entry.displayName, provider.id),
-      description: entry.description,
-      extra,
-    });
-    for (const entry of options.models) choices.push(toChoice(entry, false));
-    for (const entry of options.selectedOnlyModels) {
-      if (options.models.some((listed) => listed.model === entry.model)) continue;
-      choices.push(toChoice(entry, true));
-    }
+/** One agent's models, or null when it has no catalogue to report. */
+async function providerChoices(
+  bb: BbPluginApi,
+  provider: { id: string; displayName: string },
+): Promise<ModelChoice[] | null> {
+  let options;
+  try {
+    options = await bb.sdk.providers.models({ providerId: provider.id });
+  } catch (error) {
+    bb.log.debug(`no models for ${provider.id}: ${describeError(error)}`);
+    return null;
   }
-  return { choices, unavailable };
+  // An agent whose CLI is missing or unauthenticated reports its failure
+  // instead of a catalogue; name it rather than dropping it silently.
+  if (options.modelLoadError !== null) return null;
+
+  const toChoice = (
+    entry: { model: string; displayName: string; description: string },
+    extra: boolean,
+  ): ModelChoice => ({
+    providerId: provider.id,
+    providerName: provider.displayName,
+    model: entry.model,
+    label: stripModelBrandPrefix(entry.displayName, provider.id),
+    // Descriptions are one-liners in the picker, and the whole catalogue has
+    // to fit the 256KB kv row.
+    description: entry.description.slice(0, 160),
+    extra,
+  });
+  const choices = options.models.map((entry) => toChoice(entry, false));
+  for (const entry of options.selectedOnlyModels) {
+    if (options.models.some((listed) => listed.model === entry.model)) continue;
+    choices.push(toChoice(entry, true));
+  }
+  return choices;
 }
 
 /**

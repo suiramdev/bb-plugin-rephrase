@@ -83,8 +83,11 @@ provisioning a worktree, and is stopped and deleted on every path, including
 errors and timeouts.
 
 The picker's catalogue comes from asking every signed-in agent for its models,
-which can mean launching that agent's CLI, so it is cached for a minute; the
-reload button beside the search box refetches it. The picked model lives in the
+which can mean launching that agent's CLI and can take half a minute on a cold
+start. So the picker never waits on it: each agent's models are published as they
+arrive and appear in the list while the rest are still loading, and the finished
+catalogue is cached — later visits paint instantly and refresh in the background.
+The button beside the search box refetches it now. The picked model lives in the
 plugin's own key-value storage, not in the host-rendered settings, so the picker
 is the one place it is set.
 
