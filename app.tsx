@@ -18,6 +18,7 @@ import type {
   RephraseResult,
   rpcContract,
 } from "./server";
+import { AgentPicker } from "@/components/AgentPicker";
 import { Button } from "@/components/ui/button";
 import { COARSE_POINTER_PROMPT_ICON_ACTION_BUTTON_CLASS } from "@/components/ui/coarse-pointer-sizing";
 import { Icon } from "@/components/ui/icon";
@@ -203,5 +204,13 @@ export default definePluginApp((app) => {
           rephraseDraft(callRephraseOverHttp, composer, view),
       },
     ],
+  });
+
+  app.slots.settingsSection({
+    id: "agent",
+    title: "Agent",
+    description:
+      "Which agent rewrites your prompts. Pick a model to always use that one, or keep following the agent selected in the prompt input.",
+    component: AgentPicker,
   });
 });

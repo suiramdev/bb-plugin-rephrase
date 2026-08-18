@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-rephrase",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Re-phrase button in the bb prompt input: rewrites your draft into a clearer prompt with an agent.",
   "license": "MIT",
   "type": "module",

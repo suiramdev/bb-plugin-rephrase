@@ -4,6 +4,11 @@
 // an agent in a throwaway hidden thread and returns the rewritten prompt.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import {
+  stripModelBrandPrefix,
+  type AgentSelection,
+  type ModelChoice,
+} from "./lib/models";
 
 /** Instruction sent with the draft when the setting is left empty. */
 export const DEFAULT_INSTRUCTION = [
@@ -21,8 +26,11 @@ export const DEFAULT_INSTRUCTION = [
   "Reply with the rewritten prompt only: no preamble, no commentary, no surrounding quotes or code fences.",
 ].join("\n");
 
-/** Value stored by the `agent` setting when the composer's own agent is used. */
-const COMPOSER_AGENT = "composer";
+/** kv key holding the chosen agent; absent means the composer's own agent. */
+const SELECTION_KEY = "agent-selection";
+
+/** How long a discovered model catalogue is reused. */
+const CATALOG_TTL_MS = 60_000;
 
 const TIMEOUT_OPTIONS: Record<string, number> = {
   "30 seconds": 30_000,
@@ -31,9 +39,6 @@ const TIMEOUT_OPTIONS: Record<string, number> = {
   "5 minutes": 300_000,
 };
 const DEFAULT_TIMEOUT_OPTION = "2 minutes";
-
-/** Providers offered by the `agent` setting when discovery is unavailable. */
-const FALLBACK_PROVIDER_IDS = ["claude-code", "codex", "gemini", "cursor"];
 
 type PermissionMode = "auto" | "accept-edits" | "full";
 
@@ -66,6 +71,20 @@ const composerScopeSchema = z.discriminatedUnion("kind", [
 /** Composer scope a rephrase request came from. */
 export type ComposerScope = z.infer<typeof composerScopeSchema>;
 
+const agentSelectionSchema: z.ZodType<AgentSelection, AgentSelection> = z.object({
+  providerId: z.string().min(1),
+  model: z.string().min(1),
+});
+
+const modelChoiceSchema: z.ZodType<ModelChoice, ModelChoice> = z.object({
+  providerId: z.string(),
+  providerName: z.string(),
+  model: z.string(),
+  label: z.string(),
+  description: z.string(),
+  extra: z.boolean(),
+});
+
 export const rpcContract = defineRpcContract({
   rephrase: {
     input: z
@@ -75,6 +94,18 @@ export const rpcContract = defineRpcContract({
       z.object({ ok: z.literal(true), text: z.string() }),
       z.object({ ok: z.literal(false), error: z.string() }),
     ]),
+  },
+  catalog: {
+    input: z.object({ refresh: z.boolean() }).strict(),
+    output: z.object({
+      selection: agentSelectionSchema.nullable(),
+      choices: z.array(modelChoiceSchema),
+      unavailable: z.array(z.string()),
+    }),
+  },
+  selectAgent: {
+    input: z.object({ selection: agentSelectionSchema.nullable() }).strict(),
+    output: z.object({ selection: agentSelectionSchema.nullable() }),
   },
 });
 
@@ -97,22 +128,8 @@ interface RephraseTarget {
   environmentId: string | null;
 }
 
-export default async function plugin(bb: BbPluginApi) {
+export default function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    agent: {
-      type: "select",
-      label: "Agent",
-      description: `Agent used to rewrite prompts. "${COMPOSER_AGENT}" (the default) uses whichever agent is selected in the prompt input you clicked from.`,
-      options: [COMPOSER_AGENT, ...(await listProviderIds(bb))],
-      default: COMPOSER_AGENT,
-    },
-    model: {
-      type: "string",
-      label: "Model",
-      description:
-        "Model for the agent above. Leave empty to use that agent's default model. Ignored while Agent is \"composer\".",
-      default: "",
-    },
     instruction: {
       type: "string",
       label: "Re-phrase instruction",
@@ -128,16 +145,19 @@ export default async function plugin(bb: BbPluginApi) {
       default: DEFAULT_TIMEOUT_OPTION,
     },
   });
+  const catalog = createCatalogCache(bb);
 
   bb.rpc.register(rpcContract, {
     async rephrase({ text, scope }): Promise<RephraseResult> {
-      const { agent, model, instruction, timeout } = await settings.get();
+      const { instruction, timeout } = await settings.get();
       const timeoutMs =
         TIMEOUT_OPTIONS[timeout] ?? TIMEOUT_OPTIONS[DEFAULT_TIMEOUT_OPTION]!;
+      const selection =
+        (await bb.storage.kv.get<AgentSelection>(SELECTION_KEY)) ?? null;
 
       let target: RephraseTarget;
       try {
-        target = await resolveTarget(bb, scope, agent, model.trim());
+        target = await resolveTarget(bb, scope, selection);
       } catch (error) {
         return { ok: false, error: describeError(error) };
       }
@@ -156,43 +176,116 @@ export default async function plugin(bb: BbPluginApi) {
         return { ok: false, error: message };
       }
     },
+
+    async catalog({ refresh }) {
+      const { choices, unavailable } = await catalog.read(refresh);
+      return {
+        selection: (await bb.storage.kv.get<AgentSelection>(SELECTION_KEY)) ?? null,
+        choices,
+        unavailable,
+      };
+    },
+
+    async selectAgent({ selection }) {
+      if (selection === null) {
+        await bb.storage.kv.delete(SELECTION_KEY);
+      } else {
+        await bb.storage.kv.set(SELECTION_KEY, selection);
+      }
+      return { selection };
+    },
   });
 }
 
+/** Every model of every available provider, plus the providers that failed. */
+interface ModelCatalog {
+  choices: ModelChoice[];
+  unavailable: string[];
+}
+
 /**
- * Provider ids for the `agent` setting. Discovery goes through the SDK, which
- * is bind-gated, so a failure falls back to the known provider ids instead of
- * breaking the factory.
+ * Discovery asks each provider for its models, which can mean launching that
+ * provider's CLI, so a catalogue is reused for a minute and concurrent readers
+ * share one in-flight discovery.
  */
-async function listProviderIds(bb: BbPluginApi): Promise<string[]> {
-  try {
-    const providers = await bb.sdk.providers.list();
-    const ids = providers.map((provider) => provider.id).sort();
-    return ids.length > 0 ? ids : FALLBACK_PROVIDER_IDS;
-  } catch (error) {
-    bb.log.debug(`provider discovery unavailable: ${describeError(error)}`);
-    return FALLBACK_PROVIDER_IDS;
+function createCatalogCache(bb: BbPluginApi) {
+  let cached: { at: number; catalog: Promise<ModelCatalog> } | null = null;
+  return {
+    read(refresh: boolean): Promise<ModelCatalog> {
+      const fresh =
+        cached !== null && Date.now() - cached.at < CATALOG_TTL_MS && !refresh;
+      if (!fresh) {
+        const pending = discoverModels(bb);
+        cached = { at: Date.now(), catalog: pending };
+        // A failed discovery must not be cached as the answer for a minute.
+        pending.catch(() => {
+          if (cached?.catalog === pending) cached = null;
+        });
+      }
+      return cached!.catalog;
+    },
+  };
+}
+
+async function discoverModels(bb: BbPluginApi): Promise<ModelCatalog> {
+  const providers = (await bb.sdk.providers.list()).filter(
+    (provider) => provider.available,
+  );
+  const results = await Promise.all(
+    providers.map(async (provider) => {
+      try {
+        return {
+          provider,
+          options: await bb.sdk.providers.models({ providerId: provider.id }),
+        };
+      } catch (error) {
+        bb.log.debug(`no models for ${provider.id}: ${describeError(error)}`);
+        return { provider, options: null };
+      }
+    }),
+  );
+
+  const choices: ModelChoice[] = [];
+  const unavailable: string[] = [];
+  for (const { provider, options } of results) {
+    // A provider whose CLI is missing or unauthenticated reports its failure
+    // instead of a catalogue; name it rather than dropping it silently.
+    if (options === null || options.modelLoadError !== null) {
+      unavailable.push(provider.displayName);
+      continue;
+    }
+    const toChoice = (
+      entry: { model: string; displayName: string; description: string },
+      extra: boolean,
+    ): ModelChoice => ({
+      providerId: provider.id,
+      providerName: provider.displayName,
+      model: entry.model,
+      label: stripModelBrandPrefix(entry.displayName, provider.id),
+      description: entry.description,
+      extra,
+    });
+    for (const entry of options.models) choices.push(toChoice(entry, false));
+    for (const entry of options.selectedOnlyModels) {
+      if (options.models.some((listed) => listed.model === entry.model)) continue;
+      choices.push(toChoice(entry, true));
+    }
   }
+  return { choices, unavailable };
 }
 
 /**
  * Resolve the project, agent and environment for a rephrase.
  *
- * With the default `composer` setting the agent is read from the composer's
- * own context: the thread's provider and model for a thread-backed draft, the
- * project's execution defaults for the root compose screen.
+ * Without a picked agent the composer's own context supplies it: the thread's
+ * provider and model for a thread-backed draft, the project's execution
+ * defaults for the root compose screen.
  */
 async function resolveTarget(
   bb: BbPluginApi,
   scope: ComposerScope,
-  agentSetting: string,
-  modelSetting: string,
+  selection: AgentSelection | null,
 ): Promise<RephraseTarget> {
-  const agent =
-    agentSetting === COMPOSER_AGENT
-      ? null
-      : await overrideAgent(bb, agentSetting, modelSetting);
-
   if (scope.kind === "new-thread") {
     if (scope.projectId === null) {
       throw new Error("Pick a project in the composer first.");
@@ -207,7 +300,7 @@ async function resolveTarget(
     return {
       projectId,
       environmentId: await latestEnvironmentId(bb, projectId),
-      ...(agent ??
+      ...(selection ??
         (defaults
           ? { providerId: defaults.providerId, model: defaults.model }
           : {})),
@@ -223,25 +316,11 @@ async function resolveTarget(
   return {
     projectId: thread.projectId,
     environmentId: thread.environmentId,
-    ...(agent ?? {
+    ...(selection ?? {
       providerId: thread.providerId,
       ...(execution ? { model: execution.model } : {}),
     }),
   };
-}
-
-/** Provider + model for an explicitly configured agent. */
-async function overrideAgent(
-  bb: BbPluginApi,
-  providerId: string,
-  model: string,
-): Promise<{ providerId: string; model?: string }> {
-  if (model !== "") return { providerId, model };
-  // A provider id without a model would be filled in from the project's
-  // defaults, which may name a model that belongs to another provider.
-  const options = await bb.sdk.providers.models({ providerId }).catch(() => null);
-  const fallback = options?.models.find((entry) => entry.isDefault);
-  return fallback ? { providerId, model: fallback.model } : { providerId };
 }
 
 /**
@@ -323,8 +402,9 @@ async function runRephraseThread(
   try {
     // `turn/completed` is matched from the thread's first event, so this is
     // safe whether the turn finishes before or after the wait starts.
+    let completed;
     try {
-      await bb.sdk.threads.wait({
+      completed = await bb.sdk.threads.wait({
         threadId: worker.id,
         event: "turn/completed",
         timeoutMs,
@@ -339,6 +419,21 @@ async function runRephraseThread(
             `The agent did not answer within ${Math.round(timeoutMs / 1000)}s (${describeError(error)}).`,
           );
     }
+
+    // The turn can complete without answering — a provider that fails or is
+    // interrupted says so here, and its message beats an empty answer.
+    const event = "event" in completed ? completed.event : null;
+    if (event?.type === "turn/completed" && event.data.status !== "completed") {
+      const detail = event.data.error?.message;
+      throw new Error(
+        detail !== undefined
+          ? `The agent failed: ${detail}`
+          : event.data.status === "interrupted"
+            ? "The agent was interrupted."
+            : "The agent stopped without answering.",
+      );
+    }
+
     const { output } = await bb.sdk.threads.output({ threadId: worker.id });
     return output;
   } finally {

@@ -8,8 +8,8 @@ composer.
 - Works in every composer: a thread, a queued message, a side chat and the new
   thread screen.
 - Uses the agent selected in that prompt input, so a re-phrase runs on the model
-  you were already about to use. A different default agent can be set in the
-  plugin settings.
+  you were already about to use. Or pick one model for every re-phrase from a
+  searchable list of every model your agents offer.
 - The instruction sent with your draft is a setting too — rewrite it to match how
   you like prompts written.
 - Nothing is sent anywhere your agent does not already go: the rewrite runs
@@ -25,7 +25,7 @@ bb plugin install https://github.com/suiramdev/bb-plugin-rephrase
 Or pin a release range and let `bb plugin update` follow it:
 
 ```sh
-bb plugin install git:https://github.com/suiramdev/bb-plugin-rephrase.git@^0.1.0
+bb plugin install git:https://github.com/suiramdev/bb-plugin-rephrase.git@^0.2.0
 ```
 
 ## Use it
@@ -42,16 +42,30 @@ the compact layout that has no room for action buttons.
 
 ## Settings
 
-Extensions → Plugins → Re-phrase (or `bb plugin config rephrase`):
+Extensions → Plugins → Re-phrase.
 
-| Setting                 | Default            | What it does                                                                                                                                                       |
-| ----------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Agent**               | `composer`         | Which agent rewrites prompts. `composer` uses the agent selected in the prompt input you clicked from; any other value pins one provider for every re-phrase.        |
-| **Model**               | empty              | Model for the pinned agent above. Empty means that agent's default model. Ignored while Agent is `composer`.                                                         |
-| **Re-phrase instruction** | the built-in one | The instruction sent to the agent together with your draft. Clear it to restore the built-in instruction.                                                            |
-| **Timeout**             | 2 minutes          | How long to wait for the agent before giving up.                                                                                                                    |
+### Agent
 
-Settings are read per request, so a change applies to the next click — no reload
+A searchable model picker, the way the prompt input's own picker works: type to
+filter, and an empty box lists the default models of every signed-in agent,
+grouped by agent. Matching is loose and in order, so `gpt55` finds `gpt-5.5`, and
+searching also reaches the models the prompt input keeps behind "More models".
+
+The first row — **The agent selected in the prompt input** — is the default: each
+re-phrase then runs on whatever that composer is set to. Pick a model instead and
+every re-phrase uses that one, wherever it was started from. Picking applies
+immediately; there is nothing to save.
+
+### The rest
+
+Host-rendered settings, also reachable from `bb plugin config rephrase`:
+
+| Setting                   | Default          | What it does                                                                                              |
+| ------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------- |
+| **Re-phrase instruction** | the built-in one | The instruction sent to the agent together with your draft. Clear it to restore the built-in instruction.  |
+| **Timeout**               | 2 minutes        | How long to wait for the agent before giving up.                                                          |
+
+Everything is read per request, so a change applies to the next click — no reload
 needed.
 
 ## How it works
@@ -59,20 +73,26 @@ needed.
 `app.tsx` registers a composer action through `app.composer.customize`. Clicking
 it posts the draft and its composer scope to the `rephrase` RPC method.
 
-`server.ts` resolves which agent to use — the thread's own provider and model for
-a thread-backed draft, the project's execution defaults on the new thread
-screen, or the configured override — then spawns a **hidden** thread with your
-instruction and the draft, waits for the turn to complete, and returns the
+`server.ts` resolves which agent to use — the picked model, or, with none picked,
+the thread's own provider and model for a thread-backed draft and the project's
+execution defaults on the new thread screen — then spawns a **hidden** thread with
+your instruction and the draft, waits for the turn to complete, and returns the
 answer. The hidden thread runs in the most restrictive permission mode its
 provider supports, reuses an environment the project already has rather than
 provisioning a worktree, and is stopped and deleted on every path, including
 errors and timeouts.
 
+The picker's catalogue comes from asking every signed-in agent for its models,
+which can mean launching that agent's CLI, so it is cached for a minute; the
+reload button beside the search box refetches it. The picked model lives in the
+plugin's own key-value storage, not in the host-rendered settings, so the picker
+is the one place it is set.
+
 ## Development
 
 ```sh
 npm install
-npm test          # vitest: composer action behavior + output cleanup
+npm test          # vitest: composer action, model picker, search rules
 npm run typecheck
 bb plugin install .
 bb plugin dev     # rebuild + reload on every save
