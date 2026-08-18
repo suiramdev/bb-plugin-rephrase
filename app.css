@@ -1,0 +1,10 @@
+/* Painted over the draft while the agent rewrites it. */
+.rephrase-pending {
+  animation: rephrase-pulse 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes rephrase-pulse {
+  to {
+    opacity: 0.45;
+  }
+}
